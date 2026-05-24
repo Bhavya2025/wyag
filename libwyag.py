@@ -57,4 +57,15 @@ def repo_dir(repo, *args, mkdir = False):
         return None
 
 def repo_file(repo, *path, mkdir=False):
-    
+    if (repo_dir(repo,*(path[:-1]), mkdir=mkdir) is not None):
+        return repo_path(repo,*path)
+    else:
+        return None
+
+def repo_default_config():
+    ret = configparser.ConfigParser()
+    ret.add_section("core")
+    ret.set("core","repositoryformatversion","0")
+    ret.set("core","filemode","false")
+    ret.set("core","bare","false")
+    return ret
