@@ -69,3 +69,76 @@ def repo_default_config():
     ret.set("core","filemode","false")
     ret.set("core","bare","false")
     return ret
+
+class GitRepository(object):
+    def __init__(self, path, force=False):
+        self.worktree = path
+        self.gitdir = os.path.join(path,".git")
+        if (os.path.isdir(self.gitdir) is False and force is False):
+            raise Exception(f"Not a git repository {path}")
+        self.conf = configparser.ConfigParser()
+        rep = repo_file(self,"config")
+        if (rep and os.path.isfile(rep)):
+            self.conf.read([rep])
+        elif (force is False):
+            raise Exception("Config File Missing")
+        if not force:
+            version = int(self.conf.get("core", "repositoryformatversion"))
+            if version != 0:
+                raise Exception(f"Unsupported repositoryformatversion: {version}")
+
+def repo_create(path):
+    repo = GitRepository(path, force = True)
+    if os.path.exists(repo.worktree):
+        if not os.path.isdir(repo.worktree):
+            raise Exception(f"{path} is not a directory!")
+        if os.path.exists(repo.gitdir) and os.listdir(repo.gitdir):
+            raise Exception(f"{path} is not empty!")
+    else:
+        os.makedirs(repo.worktree)
+    repo_dir(repo, "branches", mkdir=True)
+    repo_dir(repo, "objects", mkdir=True)
+    repo_dir(repo, "refs", "tags", mkdir=True)
+    repo_dir(repo, "refs", "heads", mkdir=True)
+
+    with open(repo_file(repo, "config"), "w") as f:
+        config = repo_default_config()
+        config.write(f)
+    
+    with open(repo_file(repo, "description"), "w") as f:
+        f.write("Unnamed repository; edit this file 'description' to name the repository.\n")
+    
+    with open(repo_file(repo, "HEAD"), "w") as f:
+        f.write("ref: refs/heads/master\n")
+    return repo
+
+# --- Chapter 3.2: the `init` command ---------------------------------------
+
+argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
+argsp.add_argument("path",
+                   metavar="directory",
+                   nargs="?",
+                   default=".",
+                   help="Where to create the repository.")
+
+def cmd_init(args):
+    repo_create(args.path)
+
+# --- Chapter 3.3: finding the repository root ------------------------------
+
+def repo_find(path=".", required=True):
+    path = os.path.realpath(path)
+
+    if os.path.isdir(os.path.join(path, ".git")):
+        return GitRepository(path)
+
+    parent = os.path.realpath(os.path.join(path, ".."))
+
+    if parent == path:
+        # parent == path means we hit the filesystem root "/"
+        if required:
+            raise Exception("No git directory.")
+        else:
+            return None
+
+    return repo_find(parent, required)
