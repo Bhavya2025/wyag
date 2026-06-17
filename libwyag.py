@@ -208,8 +208,97 @@ def object_write(obj, repo=None):
                 f.write(zlib.compress(result))
     return sha
 
+def object_resolve(repo, name):
+    """Resolve a name to one or more candidate object hashes. Understands
+    HEAD, full and short hashes, tags, and branches."""
+    candidates = list()
+    hashRE = re.compile(r"^[0-9A-Fa-f]{4,40}$")
+
+    if not name.strip():
+        return None
+
+    # HEAD is unambiguous.
+    if name == "HEAD":
+        return [ref_resolve(repo, "HEAD")]
+
+    # A hex string might be a full or short hash.
+    if hashRE.match(name):
+        name = name.lower()
+        prefix = name[0:2]
+        path = repo_dir(repo, "objects", prefix, mkdir=False)
+        if path:
+            rem = name[2:]
+            # Any object whose name starts with our prefix is a match;
+            # a full hash matches exactly one, a short hash maybe several.
+            for f in os.listdir(path):
+                if f.startswith(rem):
+                    candidates.append(prefix + f)
+
+    # It could also be a tag...
+    as_tag = ref_resolve(repo, "refs/tags/" + name)
+    if as_tag:
+        candidates.append(as_tag)
+
+    # ...or a branch.
+    as_branch = ref_resolve(repo, "refs/heads/" + name)
+    if as_branch:
+        candidates.append(as_branch)
+
+    return candidates
+
 def object_find(repo, name, fmt=None, follow=True):
-    return name
+    sha = object_resolve(repo, name)
+
+    if not sha:
+        raise Exception("No such reference {0}.".format(name))
+
+    if len(sha) > 1:
+        raise Exception("Ambiguous reference {0}: Candidates are:\n - {1}.".format(
+            name, "\n - ".join(sha)))
+
+    sha = sha[0]
+
+    if not fmt:
+        return sha
+
+    # A type was requested. Follow the chain (tag -> object it tags, or
+    # commit -> its tree) until we reach the requested type or give up.
+    while True:
+        obj = object_read(repo, sha)
+
+        if obj.fmt == fmt:
+            return sha
+
+        if not follow:
+            return None
+
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode("ascii")
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode("ascii")
+        else:
+            return None
+
+# --- Chapter 8: the rev-parse command --------------------------------------
+
+argsp = argsubparsers.add_parser("rev-parse",
+                                 help="Parse revision (or other objects) identifiers")
+argsp.add_argument("--wyag-type",
+                   metavar="type",
+                   dest="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   default=None,
+                   help="Specify the expected type")
+argsp.add_argument("name",
+                   help="The name to parse")
+
+def cmd_rev_parse(args):
+    if args.type:
+        fmt = args.type.encode()
+    else:
+        fmt = None
+    repo = repo_find()
+    print(object_find(repo, args.name, fmt, follow=True))
 
 class GitBlob(GitObject):
     fmt = b'blob'
