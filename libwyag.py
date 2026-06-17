@@ -1033,3 +1033,122 @@ def check_ignore(rules, path):
         return result
 
     return check_ignore_absolute(rules.absolute, path)
+
+# --- Chapter 11: The status command ----------------------------------------
+
+argsp = argsubparsers.add_parser("status", help="Show the working tree status.")
+
+def cmd_status(_):
+    repo = repo_find()
+    index = index_read(repo)
+
+    cmd_status_branch(repo)
+    cmd_status_head_index(repo, index)
+    print()
+    cmd_status_index_worktree(repo, index)
+
+def branch_get_active(repo):
+    # The active branch is whatever HEAD points at, if it's a symref.
+    with open(repo_file(repo, "HEAD"), "r") as f:
+        head = f.read()
+
+    if head.startswith("ref: refs/heads/"):
+        return head[16:-1]   # strip the prefix and trailing newline
+    else:
+        return False         # detached HEAD
+
+def cmd_status_branch(repo):
+    branch = branch_get_active(repo)
+    if branch:
+        print("On branch {}.".format(branch))
+    else:
+        print("HEAD detached at {}".format(object_find(repo, "HEAD")))
+
+def tree_to_dict(repo, ref, prefix=""):
+    # Flatten a tree into {full_path: blob_sha}, recursing into subtrees.
+    ret = dict()
+    tree_sha = object_find(repo, ref, fmt=b"tree")
+    tree = object_read(repo, tree_sha)
+
+    for leaf in tree.items:
+        full_path = os.path.join(prefix, leaf.path)
+
+        # Classify by mode digits (handle both "40000" and "040000").
+        if len(leaf.mode) == 5:
+            type_digits = b'0' + leaf.mode[0:1]
+        else:
+            type_digits = leaf.mode[0:2]
+        is_subtree = type_digits == b'04'
+
+        if is_subtree:
+            ret.update(tree_to_dict(repo, leaf.sha, full_path))
+        else:
+            ret[full_path] = leaf.sha
+
+    return ret
+
+def cmd_status_head_index(repo, index):
+    # Compare the last commit (HEAD) with what's staged in the index.
+    print("Changes to be committed:")
+
+    head = tree_to_dict(repo, "HEAD")
+    for entry in index.entries:
+        if entry.name in head:
+            if head[entry.name] != entry.sha:
+                print("  modified:", entry.name)
+            del head[entry.name]   # seen it; remove so leftovers = deletions
+        else:
+            print("  added:   ", entry.name)
+
+    # Anything left in head is in HEAD but not the index: it was deleted.
+    for entry in head.keys():
+        print("  deleted: ", entry)
+
+def cmd_status_index_worktree(repo, index):
+    # Compare the index with the actual files on disk.
+    print("Changes not staged for commit:")
+
+    ignore = gitignore_read(repo)
+    gitdir_prefix = repo.gitdir + os.path.sep
+
+    all_files = list()
+
+    # Collect every file in the worktree, skipping the .git directory.
+    for (root, _, files) in os.walk(repo.worktree, True):
+        if root == repo.gitdir or root.startswith(gitdir_prefix):
+            continue
+        for f in files:
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, repo.worktree)
+            all_files.append(rel_path)
+
+    # Walk the index and compare each entry to its file on disk.
+    for entry in index.entries:
+        full_path = os.path.join(repo.worktree, entry.name)
+
+        if not os.path.exists(full_path):
+            print("  deleted: ", entry.name)
+        else:
+            stat = os.stat(full_path)
+
+            # Cheap check first: compare cached vs actual timestamps.
+            ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
+            mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
+            if (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+                # Timestamps differ: do the authoritative content check.
+                with open(full_path, "rb") as fd:
+                    new_sha = object_hash(fd, b"blob", None)
+                    same = entry.sha == new_sha
+                    if not same:
+                        print("  modified:", entry.name)
+
+        if entry.name in all_files:
+            all_files.remove(entry.name)
+
+    print()
+    print("Untracked files:")
+
+    # Whatever is left on disk and not ignored is untracked.
+    for f in all_files:
+        if not check_ignore(ignore, f):
+            print(" ", f)
