@@ -1,4 +1,5 @@
 import argparse
+import collections
 import configparser
 from datetime import datetime
 try:
@@ -278,3 +279,138 @@ def object_hash(fd, fmt, repo=None):
         case _: raise Exception(f"Unknown type {fmt}!")
 
     return object_write(obj, repo)
+
+# --- Chapter 5: Reading commit data ----------------------------------------
+
+def kvlm_parse(raw, start=0, dct=None):
+    # A commit (and a tag) is stored as a "Key-Value List with Message":
+    # a few "key value" header lines, a blank line, then the free-form
+    # message. We parse it one pair at a time, recursing on the rest.
+    if not dct:
+        dct = collections.OrderedDict()
+        # Note: we must build a fresh dict here rather than using
+        # dct=collections.OrderedDict() as a default argument. Default
+        # arguments are evaluated ONCE at definition time, so every call
+        # would share — and keep growing — the same dict.
+
+    # Where does the next space and the next newline appear?
+    spc = raw.find(b' ', start)
+    nl = raw.find(b'\n', start)
+
+    # Base case: a space either doesn't appear, or appears after the next
+    # newline. That means this line is blank, and everything after it is
+    # the message. We store it under the key None and stop recursing.
+    if (spc < 0) or (nl < spc):
+        assert nl == start
+        dct[None] = raw[start + 1:]
+        return dct
+
+    # Recursive case: read one "key value" header.
+    key = raw[start:spc]
+
+    # A value can span multiple lines; continuation lines start with a
+    # space. Keep scanning for the next '\n' until it is NOT followed by
+    # a space — that is the real end of the value.
+    end = start
+    while True:
+        end = raw.find(b'\n', end + 1)
+        if raw[end + 1] != ord(' '):
+            break
+
+    # Grab the value and drop the leading space of each continuation line.
+    value = raw[spc + 1:end].replace(b'\n ', b'\n')
+
+    # A key can legitimately repeat (e.g. a merge commit has two parents),
+    # so collect repeats into a list instead of overwriting.
+    if key in dct:
+        if type(dct[key]) == list:
+            dct[key].append(value)
+        else:
+            dct[key] = [dct[key], value]
+    else:
+        dct[key] = value
+
+    return kvlm_parse(raw, start=end + 1, dct=dct)
+
+def kvlm_serialize(kvlm):
+    ret = b''
+
+    # Output the header fields, in insertion order.
+    for k in kvlm.keys():
+        # The message is stored under None; we append it last.
+        if k == None:
+            continue
+        val = kvlm[k]
+        # Normalize single values to a one-element list so we can loop.
+        if type(val) != list:
+            val = [val]
+
+        for v in val:
+            # Re-indent continuation lines to match git's on-disk format.
+            ret += k + b' ' + (v.replace(b'\n', b'\n ')) + b'\n'
+
+    # Blank line separating headers from the message, then the message.
+    ret += b'\n' + kvlm[None] + b'\n'
+
+    return ret
+
+class GitCommit(GitObject):
+    fmt = b'commit'
+
+    def deserialize(self, data):
+        self.kvlm = kvlm_parse(data)
+
+    def serialize(self):
+        return kvlm_serialize(self.kvlm)
+
+    def init(self):
+        self.kvlm = dict()
+
+# --- Chapter 5.4: the log command ------------------------------------------
+
+argsp = argsubparsers.add_parser("log", help="Display history of a given commit.")
+argsp.add_argument("commit",
+                   default="HEAD",
+                   nargs="?",
+                   help="Commit to start at.")
+
+def cmd_log(args):
+    repo = repo_find()
+
+    print("digraph wyaglog{")
+    print("  node[shape=rect]")
+    log_graphviz(repo, object_find(repo, args.commit), set())
+    print("}")
+
+def log_graphviz(repo, sha, seen):
+    # A commit can be reached by more than one path (merges), so track
+    # what we've already drawn to avoid infinite loops and duplicates.
+    if sha in seen:
+        return
+    seen.add(sha)
+
+    commit = object_read(repo, sha)
+    message = commit.kvlm[None].decode("utf8").strip()
+    # Escape characters that would break the Graphviz label string.
+    message = message.replace("\\", "\\\\")
+    message = message.replace("\"", "\\\"")
+
+    if "\n" in message:  # Keep only the first line of the message.
+        message = message[:message.index("\n")]
+
+    print("  c_{0} [label=\"{1}: {2}\"]".format(sha, sha[0:7], message))
+    assert commit.fmt == b'commit'
+
+    if not b'parent' in commit.kvlm.keys():
+        # Base case: the very first commit has no parent.
+        return
+
+    parents = commit.kvlm[b'parent']
+
+    if type(parents) != list:
+        parents = [parents]
+
+    for p in parents:
+        p = p.decode("ascii")
+        print("  c_{0} -> c_{1};".format(sha, p))
+        log_graphviz(repo, p, seen)
