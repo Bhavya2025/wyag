@@ -1152,3 +1152,292 @@ def cmd_status_index_worktree(repo, index):
     for f in all_files:
         if not check_ignore(ignore, f):
             print(" ", f)
+
+# --- Chapter 12: Staging area and commits ----------------------------------
+
+def index_write(repo, index):
+    # Serialize the index back into git's binary format (inverse of
+    # index_read), byte-for-byte so git accepts it.
+    #
+    # Git requires index entries to be sorted by name (otherwise it
+    # rejects the index with "unordered stage entries"). The tutorial's
+    # add() appends new entries unsorted, so we sort here on write.
+    index.entries.sort(key=lambda e: e.name)
+
+    # Build the whole file in memory first, so we can append a SHA-1
+    # checksum of everything at the end (git requires this trailer, and
+    # rejects the index as corrupt without it).
+    content = bytearray()
+
+    # HEADER: magic, version, entry count.
+    content += b"DIRC"
+    content += index.version.to_bytes(4, "big")
+    content += len(index.entries).to_bytes(4, "big")
+
+    # ENTRIES.
+    idx = 0
+    for e in index.entries:
+        content += e.ctime[0].to_bytes(4, "big")
+        content += e.ctime[1].to_bytes(4, "big")
+        content += e.mtime[0].to_bytes(4, "big")
+        content += e.mtime[1].to_bytes(4, "big")
+        content += e.dev.to_bytes(4, "big")
+        content += e.ino.to_bytes(4, "big")
+
+        # Pack type (high 4 bits) and permissions back into the mode.
+        mode = (e.mode_type << 12) | e.mode_perms
+        content += mode.to_bytes(4, "big")
+
+        content += e.uid.to_bytes(4, "big")
+        content += e.gid.to_bytes(4, "big")
+        content += e.fsize.to_bytes(4, "big")
+        content += int(e.sha, 16).to_bytes(20, "big")
+
+        flag_assume_valid = 0b1000000000000000 if e.flag_assume_valid else 0
+
+        name_bytes = e.name.encode("utf8")
+        bytes_len = len(name_bytes)
+        if bytes_len >= 0xFFF:
+            name_length = 0xFFF
+        else:
+            name_length = bytes_len
+
+        # Merge the two flags and the name length into two bytes.
+        content += (flag_assume_valid | e.flag_stage | name_length).to_bytes(2, "big")
+        content += name_bytes
+        content += (0).to_bytes(1, "big")   # NUL terminator
+
+        idx += 62 + len(name_bytes) + 1
+
+        # Pad to the next 8-byte boundary.
+        if idx % 8 != 0:
+            pad = 8 - (idx % 8)
+            content += (0).to_bytes(pad, "big")
+            idx += pad
+
+    # Trailing checksum: SHA-1 over the entire content above.
+    content += hashlib.sha1(content).digest()
+
+    with open(repo_file(repo, "index"), "wb") as f:
+        f.write(content)
+
+# --- Chapter 12.1: the rm command ------------------------------------------
+
+argsp = argsubparsers.add_parser("rm",
+                                 help="Remove files from the working tree and the index.")
+argsp.add_argument("path", nargs="+", help="Files to remove")
+
+def cmd_rm(args):
+    repo = repo_find()
+    rm(repo, args.path)
+
+def rm(repo, paths, delete=True, skip_missing=False):
+    index = index_read(repo)
+    worktree = repo.worktree + os.sep
+
+    # Normalize to absolute paths, rejecting anything outside the worktree.
+    abspaths = set()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if abspath.startswith(worktree):
+            abspaths.add(abspath)
+        else:
+            raise Exception("Cannot remove paths outside of worktree: {}".format(paths))
+
+    kept_entries = list()
+    remove = list()
+
+    for e in index.entries:
+        full_path = os.path.join(repo.worktree, e.name)
+        if full_path in abspaths:
+            remove.append(full_path)
+            abspaths.remove(full_path)
+        else:
+            kept_entries.append(e)   # keep entries we're not removing
+
+    # Anything left was requested but not found in the index.
+    if len(abspaths) > 0 and not skip_missing:
+        raise Exception("Cannot remove paths not in the index: {}".format(abspaths))
+
+    if delete:
+        for path in remove:
+            os.unlink(path)
+
+    index.entries = kept_entries
+    index_write(repo, index)
+
+# --- Chapter 12.2: the add command -----------------------------------------
+
+argsp = argsubparsers.add_parser("add", help="Add file contents to the index.")
+argsp.add_argument("path", nargs="+", help="Files to add")
+
+def cmd_add(args):
+    repo = repo_find()
+    add(repo, args.path)
+
+def add(repo, paths, delete=True, skip_missing=False):
+    # Drop any existing index entries for these paths first (without
+    # deleting the files), so we can re-add fresh versions.
+    rm(repo, paths, delete=False, skip_missing=True)
+
+    worktree = repo.worktree + os.sep
+
+    # Validate and pair up (absolute, worktree-relative) paths.
+    clean_paths = set()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if not (abspath.startswith(worktree) and os.path.isfile(abspath)):
+            raise Exception("Not a file, or outside the worktree: {}".format(paths))
+        relpath = os.path.relpath(abspath, repo.worktree)
+        clean_paths.add((abspath, relpath))
+
+    index = index_read(repo)
+
+    for (abspath, relpath) in clean_paths:
+        # Hash the file into a blob and store it.
+        with open(abspath, "rb") as fd:
+            sha = object_hash(fd, b"blob", repo)
+
+        stat = os.stat(abspath)
+        ctime_s = int(stat.st_ctime)
+        ctime_ns = stat.st_ctime_ns % 10**9
+        mtime_s = int(stat.st_mtime)
+        mtime_ns = stat.st_mtime_ns % 10**9
+
+        entry = GitIndexEntry(ctime=(ctime_s, ctime_ns),
+                              mtime=(mtime_s, mtime_ns),
+                              dev=stat.st_dev, ino=stat.st_ino,
+                              mode_type=0b1000, mode_perms=0o644,
+                              uid=stat.st_uid, gid=stat.st_gid,
+                              fsize=stat.st_size, sha=sha,
+                              flag_assume_valid=False, flag_stage=False,
+                              name=relpath)
+        index.entries.append(entry)
+
+    index_write(repo, index)
+
+# --- Chapter 12.3: the commit command --------------------------------------
+
+argsp = argsubparsers.add_parser("commit", help="Record changes to the repository.")
+argsp.add_argument("-m",
+                   metavar="message",
+                   dest="message",
+                   help="Message to associate with this commit.")
+
+def cmd_commit(args):
+    repo = repo_find()
+    index = index_read(repo)
+
+    # Build the tree objects from the staged index, getting the root SHA.
+    tree = tree_from_index(repo, index)
+
+    author = gitconfig_user_get(gitconfig_read())
+    if not author:
+        raise Exception(
+            "No user identity configured. Set user.name and user.email in your git config.")
+
+    # Create the commit object pointing at the new tree and current HEAD.
+    commit = commit_create(repo,
+                           tree,
+                           object_find(repo, "HEAD"),
+                           author,
+                           datetime.now(),
+                           args.message)
+
+    # Move the current branch (or HEAD, if detached) to the new commit.
+    active_branch = branch_get_active(repo)
+    if active_branch:
+        with open(repo_file(repo, os.path.join("refs/heads", active_branch)), "w") as fd:
+            fd.write(commit + "\n")
+    else:
+        with open(repo_file(repo, "HEAD"), "w") as fd:
+            fd.write(commit + "\n")
+
+    print("Committed {}".format(commit))
+
+def tree_from_index(repo, index):
+    # Reconstruct the nested tree hierarchy from the flat index. We group
+    # entries by directory, then build trees bottom-up so each directory's
+    # tree SHA is known before we add it to its parent.
+    contents = dict()
+    contents[""] = list()
+
+    # Make sure every directory along each path has a bucket, up to root.
+    for entry in index.entries:
+        dirname = os.path.dirname(entry.name)
+
+        key = dirname
+        while key != "":
+            if not key in contents:
+                contents[key] = list()
+            key = os.path.dirname(key)
+
+        contents[dirname].append(entry)
+
+    # Sort directories longest-first so children are built before parents.
+    sorted_paths = sorted(contents.keys(), key=len, reverse=True)
+
+    sha = None
+    for path in sorted_paths:
+        tree = GitTree()
+
+        for entry in contents[path]:
+            if isinstance(entry, GitIndexEntry):
+                # A real file: render the integer mode as ASCII octal.
+                leaf_mode = "{:02o}{:04o}".format(
+                    entry.mode_type, entry.mode_perms).encode("ascii")
+                leaf = GitTreeLeaf(mode=leaf_mode,
+                                   path=os.path.basename(entry.name),
+                                   sha=entry.sha)
+            else:
+                # A subtree we built earlier, stored as (basename, sha).
+                leaf = GitTreeLeaf(mode=b"040000", path=entry[0], sha=entry[1])
+
+            tree.items.append(leaf)
+
+        sha = object_write(tree, repo)
+
+        # Register this tree with its parent directory.
+        parent = os.path.dirname(path)
+        base = os.path.basename(path)
+        contents[parent].append((base, sha))
+
+    return sha
+
+def gitconfig_read():
+    # Read the user's git identity from the standard config locations.
+    xdg_config_home = os.environ["XDG_CONFIG_HOME"] if "XDG_CONFIG_HOME" in os.environ else "~/.config"
+    configfiles = [
+        os.path.expanduser(os.path.join(xdg_config_home, "git/config")),
+        os.path.expanduser("~/.gitconfig"),
+    ]
+    config = configparser.ConfigParser()
+    config.read(configfiles)
+    return config
+
+def gitconfig_user_get(config):
+    if "user" in config:
+        if "name" in config["user"] and "email" in config["user"]:
+            return "{} <{}>".format(config["user"]["name"], config["user"]["email"])
+    return None
+
+def commit_create(repo, tree, parent, author, timestamp, message):
+    commit = GitCommit()
+    commit.kvlm[b"tree"] = tree.encode("ascii")
+    if parent:
+        commit.kvlm[b"parent"] = parent.encode("ascii")
+
+    # Build the "Name <email> <unix-seconds> <tz-offset>" author line.
+    offset = int(timestamp.astimezone().utcoffset().total_seconds())
+    sign = "+" if offset >= 0 else "-"
+    offset = abs(offset)
+    hours = offset // 3600
+    minutes = (offset % 3600) // 60
+    tz = "{}{:02}{:02}".format(sign, hours, minutes)
+
+    author_line = author + timestamp.strftime(" %s ") + tz
+    commit.kvlm[b"author"] = author_line.encode("utf8")
+    commit.kvlm[b"committer"] = author_line.encode("utf8")
+    commit.kvlm[None] = (message.strip() + "\n").encode("utf8")
+
+    return object_write(commit, repo)
